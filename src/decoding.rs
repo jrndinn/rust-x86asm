@@ -194,7 +194,7 @@ impl<T: Read> InstructionReader<T> {
         let operand_results: Result<Vec<Operand>, InstructionDecodingError> = 
             def.operands.iter().filter_map(
                 |maybe_op_def| maybe_op_def.as_ref().map(
-                    |op_def| self.read_operand(op_def, &buffer)
+                    |op_def| self.read_operand(op_def, &buffer, &mut bytes_read)
             )).collect();
         let mut operands_iter = operand_results?.into_iter();
 
@@ -225,12 +225,11 @@ impl<T: Read> InstructionReader<T> {
         Ok((instruction, bytes_read))
     }
 
-    fn read_operand(&mut self, op_def: &OperandDefinition, buffer: &InstructionBuffer)
+    fn read_operand(&mut self, op_def: &OperandDefinition, buffer: &InstructionBuffer, bytes_read: &mut usize)
         -> Result<Operand, InstructionDecodingError> {
 
         let size = InstructionReader::<T>::get_operand_size(op_def, buffer);
         let addr_size = InstructionReader::<T>::get_address_size(self.mode, buffer);
-        let mut bytes_read = 0usize;
 
         // We can assume that we have a ModR/M byte if we've gotten to this point as it
         // would have errored out if we needed one but didn't read one.
@@ -263,28 +262,28 @@ impl<T: Read> InstructionReader<T> {
                 match op_def.op_type {
                     OperandType::Reg(reg_type) =>
                         Ok(Operand::Direct(Reg::from_code_reg_type(
-                            self.expect_byte(&mut bytes_read)? >> 4, reg_type, size, buffer.has_rex())
+                            self.expect_byte(bytes_read)? >> 4, reg_type, size, buffer.has_rex())
                             .ok_or(InstructionDecodingError::InvalidInstruction)?)),
                     OperandType::Imm => match op_def.size {
-                        OperandSize::Byte => self.expect_byte(&mut bytes_read).map(|b| Operand::Literal8(b)),
+                        OperandSize::Byte => self.expect_byte(bytes_read).map(|b| Operand::Literal8(b)),
                         OperandSize::Word => 
-                            (0..2).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte(&mut bytes_read).map(
+                            (0..2).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte(bytes_read).map(
                                 |b| a | ((b as u16) << (8*n) )))).map(|b| Operand::Literal16(b)),
                         OperandSize::Dword => 
-                            (0..4).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte(&mut bytes_read).map(
+                            (0..4).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte(bytes_read).map(
                                 |b| a | ((b as u32) << (8*n) )))).map(|b| Operand::Literal32(b)),
                         OperandSize::Far16 => { // 16:16
                             let addr = (0..2).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u16) << (8*n) ))))?;
+                                self.expect_byte(bytes_read).map(|b| a | ((b as u16) << (8*n) ))))?;
                             let segment = (0..2).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u16) << (8*n) ))))?;
+                                self.expect_byte(bytes_read).map(|b| a | ((b as u16) << (8*n) ))))?;
                             Ok(Operand::MemoryAndSegment16(segment, addr))
                         },
                         OperandSize::Far32 => { // 16:32
                             let addr = (0..4).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u32) << (8*n) ))))?;
+                                self.expect_byte(bytes_read).map(|b| a | ((b as u32) << (8*n) ))))?;
                             let segment = (0..2).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u16) << (8*n) ))))?;
+                                self.expect_byte(bytes_read).map(|b| a | ((b as u16) << (8*n) ))))?;
                             Ok(Operand::MemoryAndSegment32(segment, addr))
                         },
                         _ => Err(InstructionDecodingError::NotImplemented)
@@ -292,7 +291,7 @@ impl<T: Read> InstructionReader<T> {
                     OperandType::Rel(_) => 
                         Ok(Operand::Offset(
                             (0..op_def.size.bits() >> 3).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u64) << (8*n) ))))?,
+                                self.expect_byte(bytes_read).map(|b| a | ((b as u64) << (8*n) ))))?,
                             None, None)),
                     _ => Err(InstructionDecodingError::InvalidInstruction) 
                 },
