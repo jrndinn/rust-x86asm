@@ -14,7 +14,7 @@ fn decode_helper(bytes: &Vec<u8>, mode: Mode, expected: &Instruction) {
     println!("decode_helper ({:?}): {:?}\n", mode, expected);
     let buffer = Cursor::new(bytes);
     let mut reader = InstructionReader::new(buffer, mode);
-    assert_eq!(reader.read().expect("Decoding failed"), *expected);
+    assert_eq!(reader.read().expect("Decoding failed").0, *expected);
 }
 
 fn encode16_helper(instr: &Instruction, expected: &Vec<u8>) {

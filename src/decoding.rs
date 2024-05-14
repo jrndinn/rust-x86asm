@@ -18,21 +18,26 @@ impl<T: Read> InstructionReader<T> {
         }
     }
 
-    fn expect_byte(&mut self) -> Result<u8, InstructionDecodingError> {
+    fn expect_byte(&mut self, counter: &mut usize) -> Result<u8, InstructionDecodingError> {
         match self.reader.next() {
-            Some(Ok(b)) => Ok(b),
+            Some(Ok(b)) => {
+                *counter += 1;
+                return Ok(b);
+            },
             Some(Err(_)) => Err(InstructionDecodingError::ReadError),
             None => Err(InstructionDecodingError::PartialInstruction)
         }
     }
     
     #[allow(unused_assignments)] // Compiler wrongly complains about opcode_byte not being read?
-    pub fn read(&mut self) -> Result<Instruction, InstructionDecodingError> {
+    pub fn read(&mut self) -> Result<(Instruction, usize), InstructionDecodingError> {
         let mut buffer: InstructionBuffer = Default::default();
         let mut reg_ext = 0; // Extension to mod_rm_reg field
         let mut index_ext = 0; // Extension to sib_index field
         let mut b_ext = 0; // Extension to mod_rm_rm field or sib_base field
         let mut opcode_byte = 0;
+
+        let mut bytes_read = 0usize;
 
         // Check for end of stream
         if self.reader.peek().is_none() {
@@ -41,7 +46,7 @@ impl<T: Read> InstructionReader<T> {
 
         // Read prefixes
         loop {
-            let b = self.expect_byte()?;
+            let b = self.expect_byte(&mut bytes_read)?;
             // TODO This could be written without match
             let lookahead: Option<u8> = match self.reader.peek() { 
                 Some(&Ok(b)) => Some(b),
@@ -63,7 +68,7 @@ impl<T: Read> InstructionReader<T> {
                 PREFIX_GS => { buffer.prefix2 = Some(Prefix2::GS); },
                 PREFIX_TWO_BYTE_OPCODE => { buffer.is_two_byte_opcode = true; },
                 PREFIX_VEX2 => { // Two-byte VEX prefix
-                    let data = self.expect_byte()?;
+                    let data = self.expect_byte(&mut bytes_read)?;
                     buffer.composite_prefix = Some(CompositePrefix::Vex);
                     reg_ext = if data & 0x80 != 0 || self.mode != Mode::Long { 0 } else { 0x8 };
                     buffer.vex_operand = Some((!data >> 3) & if self.mode == Mode::Long { 0xF } else { 0x7 });
@@ -78,8 +83,8 @@ impl<T: Read> InstructionReader<T> {
                     }
                 },
                 PREFIX_VEX3 => { // Three-byte VEX prefix
-                    let data1 = self.expect_byte()?;
-                    let data2 = self.expect_byte()?;
+                    let data1 = self.expect_byte(&mut bytes_read)?;
+                    let data2 = self.expect_byte(&mut bytes_read)?;
                     buffer.composite_prefix = Some(CompositePrefix::Vex);
                     reg_ext = if data1 & 0x80 != 0 || self.mode != Mode::Long { 0 } else { 0x8 };
                     index_ext = if data1 & 0x40 != 0 || self.mode != Mode::Long { 0 } else { 0x8 };
@@ -102,9 +107,9 @@ impl<T: Read> InstructionReader<T> {
                     }
                 },
                 PREFIX_EVEX if self.mode == Mode::Long || lookahead.map_or(false, |l| l & 0xC0 == 0xC0) => {
-                    let data1 = self.expect_byte()?;
-                    let data2 = self.expect_byte()?;
-                    let data3 = self.expect_byte()?;
+                    let data1 = self.expect_byte(&mut bytes_read)?;
+                    let data2 = self.expect_byte(&mut bytes_read)?;
+                    let data3 = self.expect_byte(&mut bytes_read)?;
                     buffer.composite_prefix = Some(CompositePrefix::Evex);
                     reg_ext |= if data1 & 0x80 == 0 && self.mode == Mode::Long { 0x8 } else { 0 };
                     index_ext |= if data1 & 0x40 == 0 && self.mode == Mode::Long { 0x8 } else { 0 };
@@ -153,7 +158,7 @@ impl<T: Read> InstructionReader<T> {
         }
 
         if (buffer.primary_opcode == 0x38 || buffer.primary_opcode == 0x3A) && buffer.secondary_opcode.is_none() {
-            buffer.secondary_opcode = Some(self.expect_byte()?);
+            buffer.secondary_opcode = Some(self.expect_byte(&mut bytes_read)?);
         }
 
         // Find the matching instruction definition
@@ -162,14 +167,14 @@ impl<T: Read> InstructionReader<T> {
         // Read a ModR/M if we found a valid def which needs one or if we need one to disambiguate.
         if def_res.map(|def| InstructionReader::<T>::has_mod_rm(def)).unwrap_or(false) ||
             matches!(def_res, Err(FindInstructionDefByOpcodeError::NeedModRm)) {
-            let mod_rm = self.expect_byte()?;
+            let mod_rm = self.expect_byte(&mut bytes_read)?;
             buffer.mod_rm_mod = Some(mod_rm >> 6);
             buffer.mod_rm_reg = Some((mod_rm >> 3) & 0x7 | reg_ext);
             buffer.mod_rm_rm = Some(mod_rm & 0x7);
             
             // SIB
             if InstructionReader::<T>::has_sib(addr_mode, &buffer) {
-                let sib = self.expect_byte()?;
+                let sib = self.expect_byte(&mut bytes_read)?;
                 buffer.sib_scale = Some(sib >> 6);
                 buffer.sib_index = Some((sib >> 3) & 0x7 | index_ext);
                 buffer.sib_base = Some(sib & 0x7 | b_ext);
@@ -193,7 +198,7 @@ impl<T: Read> InstructionReader<T> {
             )).collect();
         let mut operands_iter = operand_results?.into_iter();
 
-        Ok(Instruction {
+        let instruction = Instruction {
             mnemonic: def.mnemonic,
             operand1: operands_iter.next(),
             operand2: operands_iter.next(),
@@ -215,7 +220,9 @@ impl<T: Read> InstructionReader<T> {
                 buffer.mask_reg.map(|r| MaskReg::from_code(r).unwrap())
             } else { None },
             broadcast: InstructionReader::<T>::get_broadcast(def, &buffer),
-        })
+        };
+
+        Ok((instruction, bytes_read))
     }
 
     fn read_operand(&mut self, op_def: &OperandDefinition, buffer: &InstructionBuffer)
@@ -223,6 +230,7 @@ impl<T: Read> InstructionReader<T> {
 
         let size = InstructionReader::<T>::get_operand_size(op_def, buffer);
         let addr_size = InstructionReader::<T>::get_address_size(self.mode, buffer);
+        let mut bytes_read = 0usize;
 
         // We can assume that we have a ModR/M byte if we've gotten to this point as it
         // would have errored out if we needed one but didn't read one.
@@ -255,28 +263,28 @@ impl<T: Read> InstructionReader<T> {
                 match op_def.op_type {
                     OperandType::Reg(reg_type) =>
                         Ok(Operand::Direct(Reg::from_code_reg_type(
-                            self.expect_byte()? >> 4, reg_type, size, buffer.has_rex())
+                            self.expect_byte(&mut bytes_read)? >> 4, reg_type, size, buffer.has_rex())
                             .ok_or(InstructionDecodingError::InvalidInstruction)?)),
                     OperandType::Imm => match op_def.size {
-                        OperandSize::Byte => self.expect_byte().map(|b| Operand::Literal8(b)),
+                        OperandSize::Byte => self.expect_byte(&mut bytes_read).map(|b| Operand::Literal8(b)),
                         OperandSize::Word => 
-                            (0..2).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte().map(
+                            (0..2).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte(&mut bytes_read).map(
                                 |b| a | ((b as u16) << (8*n) )))).map(|b| Operand::Literal16(b)),
                         OperandSize::Dword => 
-                            (0..4).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte().map(
+                            (0..4).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte(&mut bytes_read).map(
                                 |b| a | ((b as u32) << (8*n) )))).map(|b| Operand::Literal32(b)),
                         OperandSize::Far16 => { // 16:16
                             let addr = (0..2).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte().map(|b| a | ((b as u16) << (8*n) ))))?;
+                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u16) << (8*n) ))))?;
                             let segment = (0..2).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte().map(|b| a | ((b as u16) << (8*n) ))))?;
+                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u16) << (8*n) ))))?;
                             Ok(Operand::MemoryAndSegment16(segment, addr))
                         },
                         OperandSize::Far32 => { // 16:32
                             let addr = (0..4).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte().map(|b| a | ((b as u32) << (8*n) ))))?;
+                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u32) << (8*n) ))))?;
                             let segment = (0..2).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte().map(|b| a | ((b as u16) << (8*n) ))))?;
+                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u16) << (8*n) ))))?;
                             Ok(Operand::MemoryAndSegment32(segment, addr))
                         },
                         _ => Err(InstructionDecodingError::NotImplemented)
@@ -284,7 +292,7 @@ impl<T: Read> InstructionReader<T> {
                     OperandType::Rel(_) => 
                         Ok(Operand::Offset(
                             (0..op_def.size.bits() >> 3).fold(Ok(0), |acc, n| acc.and_then(|a|
-                                self.expect_byte().map(|b| a | ((b as u64) << (8*n) ))))?,
+                                self.expect_byte(&mut bytes_read).map(|b| a | ((b as u64) << (8*n) ))))?,
                             None, None)),
                     _ => Err(InstructionDecodingError::InvalidInstruction) 
                 },
@@ -326,22 +334,26 @@ impl<T: Read> InstructionReader<T> {
     }
 
     fn read_disp8(&mut self) -> Result<u8, InstructionDecodingError> {
-        self.expect_byte()
+        let mut bytes_read = 0usize;
+        self.expect_byte(&mut bytes_read)
     }
 
     fn read_disp16(&mut self) -> Result<u16, InstructionDecodingError> {
-        (0..2).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte().map(
+        let mut bytes_read = 0usize;
+        (0..2).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte(&mut bytes_read).map(
             |b| a | ((b as u16) << (8*n) ))))
     }
 
     fn read_disp32(&mut self) -> Result<u32, InstructionDecodingError> {
-        (0..4).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte().map(
+        let mut bytes_read = 0usize;
+        (0..4).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte(&mut bytes_read).map(
             |b| a | ((b as u32) << (8*n) ))))
     }
 
     #[allow(dead_code)]
     fn read_disp64(&mut self) -> Result<u64, InstructionDecodingError> {
-        (0..8).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte().map(
+        let mut bytes_read = 0usize;
+        (0..8).fold(Ok(0), |acc, n| acc.and_then(|a| self.expect_byte(&mut bytes_read).map(
             |b| a | ((b as u64) << (8*n) ))))
     }
 
